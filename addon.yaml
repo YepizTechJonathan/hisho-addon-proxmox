@@ -1,0 +1,30 @@
+# Proxmox VE integration: one entry per Proxmox server. Shows each server's state and the
+# VMs and containers on it, and starts or shuts them down. Add a server from its dashboard page:
+# in Proxmox, Datacenter > Permissions > API Tokens > Add (user root@pam, Token ID e.g. "hisho",
+# untick Privilege Separation); it then shows "Token ID" (root@pam!hisho) and "Secret" once.
+# Paste both and press Add: Hisho tests the connection first and remembers the certificate.
+name: proxmox
+kind: integration
+secret_rotate: Proxmox > Datacenter > Permissions > API Tokens (remove and add the token again)
+title: Proxmox
+description: Your Proxmox servers, their VMs and containers, with start and shutdown, CPU temperatures, a clean server shutdown, and Hisho's updates for each server with an "update now" button.
+version: 0.5.1
+you_need:
+  - "A Proxmox VE server you can reach from the Core machine"
+  - "A Proxmox API token (Datacenter > Permissions > API Tokens)"
+provider: provider.py
+entry_form:                # what the page asks for
+  url: "IP address (or full URL if you changed Proxmox's port)"
+  token_id: "Token ID (e.g. hisho@pve!hisho), or its secret's name in Bitwarden"
+  token_secret: "Secret (paste it, or its secret's name in Bitwarden)"
+  note: "Note"
+entry_label: Proxmox server
+entry_schema:
+  url: str                 # IP or name (https and port 8006 assumed), or a full URL if changed
+  token_id: "str?"         # as Proxmox shows it, e.g. root@pam!hisho (or a secret's name holding it)
+  token_secret: "password?"  # the Secret Proxmox shows once (kept only on the Core machine)
+  token: "secret?"         # instead of the two above: a secret's name holding user@realm!id=secret
+  fingerprint: "str?"      # the server certificate's SHA-256 (learned by Test / Add)
+  note: "str?"
+  thermal_ssh: "str?"      # user@host whose authorized_keys forces `hisho-thermal-guard print` for Core's key
+  thermal_key: "str?"      # Core's private key for that (default ~/.ssh/hisho_thermal_ed25519)
