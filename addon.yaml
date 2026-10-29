@@ -8,7 +8,7 @@ kind: integration
 secret_rotate: Proxmox > Datacenter > Permissions > API Tokens (remove and add the token again)
 title: Proxmox
 description: Your Proxmox servers, their VMs and containers, with start and shutdown, CPU temperatures, a clean server shutdown, and Hisho's updates for each server with an "update now" button.
-version: 0.5.1
+version: 0.5.2
 you_need:
   - "A Proxmox VE server you can reach from the Core machine"
   - "A Proxmox API token (Datacenter > Permissions > API Tokens)"
@@ -28,3 +28,21 @@ entry_schema:
   note: "str?"
   thermal_ssh: "str?"      # user@host whose authorized_keys forces `hisho-thermal-guard print` for Core's key
   thermal_key: "str?"      # Core's private key for that (default ~/.ssh/hisho_thermal_ed25519)
+help:
+  url:
+    label: Proxmox address
+    say: "The address you open Proxmox at, like 192.0.2.10. Just the IP is enough: Hisho assumes https and port 8006. Type the full address only if you changed the port."
+    get: "https://pve.proxmox.com/pve-docs/chapter-pve-gui.html"
+    get_label: About the Proxmox web page
+  token_id:
+    label: Token ID
+    say: "Make it in Proxmox under Datacenter > Permissions > API Tokens > Add: user root@pam, Token ID hisho, and untick Privilege Separation so it can start and stop VMs. Proxmox then shows the Token ID, like root@pam!hisho."
+    get: "https://pve.proxmox.com/pve-docs/chapter-pveum.html#pveum_tokens"
+    get_label: How to make an API token
+  token_secret:
+    label: Token secret
+    say: "The Secret Proxmox shows next to the Token ID. It is shown only once, right after you make the token: copy it then."
+    get: "https://pve.proxmox.com/pve-docs/chapter-pveum.html#pveum_tokens"
+    get_label: How to make an API token
+  note:
+    say: "Anything you want to remember about this server, like where it is."
