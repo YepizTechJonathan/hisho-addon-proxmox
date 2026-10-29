@@ -1,9 +1,15 @@
 """Proxmox VE integration for Hisho (see addon.yaml). Runs inside Core."""
 from __future__ import annotations
 
+import hashlib
+import http.client
+import json
 import os
 import re
+import ssl
 import subprocess
+import time
+import urllib.parse
 from typing import Any
 
 GiB = 1024 ** 3
@@ -379,3 +385,146 @@ def act(entries: dict[str, dict[str, Any]], ctx: Any, entry: str, item: str, act
     upid = api.post(f"/nodes/{guest['node']}/{kind}/{item}/status/{action}",
                     **({"timeout": 180} if action == "shutdown" else {}))
     return {"ok": True, "message": f"{action} sent to {guest.get('name')}", "task": str(upid)[:120]}
+
+
+# ── sign in once: Hisho makes its own user and token ─────────────────────
+
+#: What Hisho's own user ``hisho@pve`` may do, as two roles on ``/`` so either can be taken away on its own
+#: (Datacenter > Permissions). ``Hisho``: see the servers, VMs and containers, start and shut them down, shut a
+#: server down cleanly. ``HishoCreate``: make a new machine (Core's "add a machine": put Ubuntu's image on a
+#: storage, create the VM, grow its disk); ``Sys.Modify`` is what Proxmox asks for to download the image.
+#: Neither role can change users or permissions, open a shell or console on the server, or touch backups.
+HISHO_USER = "hisho@pve"
+ROLES = {
+    "Hisho": ["VM.Audit", "VM.PowerMgmt", "Sys.Audit", "Sys.PowerMgmt"],
+    "HishoCreate": ["VM.Allocate", "VM.Audit", "VM.PowerMgmt", "VM.Console", "VM.Config.Disk", "VM.Config.CDROM",
+                    "VM.Config.CPU", "VM.Config.Memory", "VM.Config.Network", "VM.Config.Cloudinit",
+                    "VM.Config.Options", "VM.Config.HWType", "Datastore.AllocateSpace", "Datastore.AllocateTemplate",
+                    "Datastore.Audit", "Sys.Audit", "Sys.Modify", "SDN.Use"],
+}
+
+
+class ConnectError(RuntimeError):
+    pass
+
+
+def _learn_fingerprint(host: str, port: int) -> str:
+    """The server certificate's SHA-256, as Test learns it (Proxmox's own certificate is self-signed)."""
+    from hisho.proxmox_create import ProxmoxAPI
+    probe = ProxmoxAPI.__new__(ProxmoxAPI)
+    probe.host, probe.port, probe.timeout = host, port, 8
+    return probe.server_fingerprint()
+
+
+def _send(host: str, port: int, fingerprint: str, method: str, path: str, params: dict[str, Any],
+          headers: dict[str, str]) -> tuple[int, str]:
+    """One HTTPS request to ``/api2/json<path>``, only to the certificate just learned (tests replace this)."""
+    ctx = ssl.create_default_context()
+    ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE      # checked by fingerprint instead
+    conn = http.client.HTTPSConnection(host, port, timeout=15, context=ctx)
+    try:
+        conn.connect()
+        der = conn.sock.getpeercert(binary_form=True) or b""
+        if hashlib.sha256(der).hexdigest() != fingerprint.replace(":", "").lower():
+            raise ConnectError("the server's certificate changed while signing in; Hisho stopped before sending anything")
+        query = method in ("GET", "DELETE")
+        body = None if query else urllib.parse.urlencode(params)
+        full = "/api2/json" + path + ("?" + urllib.parse.urlencode(params) if query and params else "")
+        if body is not None:
+            headers = {**headers, "Content-Type": "application/x-www-form-urlencoded"}
+        conn.request(method, full, body=body, headers=headers)
+        resp = conn.getresponse()
+        return resp.status, resp.read().decode(errors="replace")
+    finally:
+        conn.close()
+
+
+class AdminSession:
+    """Signed in with the admin login the owner typed (a ticket; the password is sent once and kept nowhere)."""
+
+    def __init__(self, url: str, user: str, password: str) -> None:
+        from hisho.proxmox_create import split_url
+        self.host, self.port = split_url(server_url(url))
+        try:
+            self.fingerprint = _learn_fingerprint(self.host, self.port)
+        except OSError as exc:
+            raise ConnectError(f"can't reach {self.host}:{self.port} ({type(exc).__name__}); check the address "
+                               "and that the server is on") from None
+        user = str(user or "").strip()
+        if not user:
+            raise ConnectError("type the admin user, e.g. root@pam")
+        if "@" not in user:
+            user += "@pam"                    # what the Proxmox sign-in page means by a bare "root"
+        self.headers: dict[str, str] = {}
+        status, raw = _send(self.host, self.port, self.fingerprint, "POST", "/access/ticket",
+                            {"username": user, "password": password}, {})
+        data = (json.loads(raw) if raw.strip().startswith("{") else {}).get("data") if status < 400 else None
+        if not data or not data.get("ticket"):
+            raise ConnectError(f"Proxmox refused the sign-in for {user}: check the user (with its realm, like "
+                               "root@pam) and the password")
+        if data.get("NeedTFA"):
+            raise ConnectError(f"{user} uses two-factor sign-in, which Hisho can't do here; sign in once with an "
+                               "admin without it, or make the token by hand (+ add by filling in every field)")
+        self.user = user
+        self.headers = {"Cookie": f"PVEAuthCookie={data['ticket']}",
+                        "CSRFPreventionToken": str(data.get("CSRFPreventionToken") or "")}
+
+    def call(self, method: str, where: str, **params: Any) -> Any:
+        status, raw = _send(self.host, self.port, self.fingerprint, method, where, params, self.headers)
+        if status >= 400:
+            why = "Proxmox says this admin may not do that" if status == 403 else f"HTTP {status}"
+            raise ConnectError(f"{method} {where}: {why} {raw[:200]}".strip())
+        return (json.loads(raw) if raw.strip() else {}).get("data")
+
+
+def _role_privs(s: AdminSession) -> dict[str, str]:
+    """ROLES, cut to the privileges this Proxmox has (the Administrator role holds every one): a privilege
+    renamed or dropped in a Proxmox release is left out instead of failing the sign-in."""
+    try:
+        have = set(s.call("GET", "/access/roles/Administrator") or {})
+    except ConnectError:
+        have = set()
+    return {role: ",".join(p for p in privs if not have or p in have) for role, privs in ROLES.items()}
+
+
+def _token_name(existing: set[str]) -> str:
+    name = "hisho"
+    if name in existing:
+        name = f"hisho-{time.strftime('%Y%m%d')}"
+        n = 2
+        while name in existing:
+            name, n = f"hisho-{time.strftime('%Y%m%d')}-{n}", n + 1
+    return name
+
+
+def connect(values: dict[str, Any], ctx: Any) -> dict[str, Any]:
+    """Sign in once with an admin login, then make Hisho's own access: user hisho@pve with the roles in ROLES on
+    ``/`` and an API token that has exactly the user's rights. Returns the entry (address, token, certificate)."""
+    s = AdminSession(str(values.get("url") or ""), str(values.get("user") or ""), str(values.get("password") or ""))
+    made = []
+    roles = {r.get("roleid") for r in s.call("GET", "/access/roles") or []}
+    for role, privs in _role_privs(s).items():
+        if role in roles:
+            s.call("PUT", f"/access/roles/{role}", privs=privs)
+        else:
+            s.call("POST", "/access/roles", roleid=role, privs=privs)
+            made.append(f"role {role}")
+    users = {u.get("userid") for u in s.call("GET", "/access/users") or []}
+    if HISHO_USER not in users:
+        s.call("POST", "/access/users", userid=HISHO_USER,
+               comment="Hisho: sees and powers VMs, makes new machines. Token only, no password.")
+        made.insert(0, f"user {HISHO_USER}")
+    s.call("PUT", "/access/acl", path="/", users=HISHO_USER, roles=",".join(ROLES), propagate=1)
+    quoted = urllib.parse.quote(HISHO_USER, safe="")
+    tokens = {t.get("tokenid") for t in s.call("GET", f"/access/users/{quoted}/token") or []}
+    name = _token_name(tokens)
+    got = s.call("POST", f"/access/users/{quoted}/token/{name}", privsep=0,
+                 comment=f"Hisho, made by signing in once as {s.user}") or {}
+    if not got.get("value"):
+        raise ConnectError("Proxmox made the token but did not show its secret; try again")
+    made.append(f"token {name}")
+    return {"ok": True,
+            "entry": {"url": str(values.get("url") or "").strip(), "token_id": got.get("full-tokenid") or f"{HISHO_USER}!{name}",
+                      "token_secret": got["value"], "fingerprint": s.fingerprint},
+            "message": f"Made {', '.join(made)} on {s.host}: Hisho can see and power your VMs and make new machines, "
+                       "nothing more. Your admin password was used once and not kept."}

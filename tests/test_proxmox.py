@@ -246,3 +246,141 @@ def test_no_update_button_while_an_update_runs(fleet, monkeypatch, tmp_path):
     assert not [a for a in sec["items"][0]["actions"] if a["id"] == "update-now"]
     res = addons.act(px, "Pve1", "node-pve1", "update-now", ctx)
     assert not res["ok"] and "weekly run" in res["error"] and started == []
+
+
+# ── Find it and Sign in once ──────────────────────────────────────────────
+
+import json
+
+import pytest
+
+ADMIN_PRIVS = {p: 1 for p in ("VM.Audit", "VM.PowerMgmt", "VM.Allocate", "VM.Console", "VM.Config.Disk",
+                              "VM.Config.CDROM", "VM.Config.CPU", "VM.Config.Memory", "VM.Config.Network",
+                              "VM.Config.Cloudinit", "VM.Config.Options", "VM.Config.HWType", "Datastore.AllocateSpace",
+                              "Datastore.AllocateTemplate", "Datastore.Audit", "Sys.Audit", "Sys.Modify", "Sys.PowerMgmt",
+                              "Permissions.Modify")}   # no SDN.Use on this (pretend) older Proxmox
+
+
+class FakePVE:
+    """A Proxmox API in memory: what Hisho's sign-in sends, and what it answers."""
+
+    def __init__(self, password="right-pass", users=(), tokens=(), roles=("Administrator", "PVEAuditor")):
+        self.password, self.users, self.tokens, self.roles = password, list(users), list(tokens), list(roles)
+        self.calls = []
+
+    def __call__(self, host, port, fingerprint, method, path, params, headers):
+        self.calls.append((method, path, dict(params), dict(headers)))
+        assert fingerprint == "AA:BB" and host == "192.0.2.10" and port == 8006
+        ok = lambda data: (200, json.dumps({"data": data}))
+        if path == "/access/ticket":
+            if params["password"] != self.password:
+                return 401, '{"data":null}'
+            return ok({"ticket": "PVE:root@pam:TICKET", "CSRFPreventionToken": "CSRF1", "username": params["username"]})
+        assert headers["Cookie"] == "PVEAuthCookie=PVE:root@pam:TICKET" and headers["CSRFPreventionToken"] == "CSRF1"
+        if (method, path) == ("GET", "/access/roles/Administrator"):
+            return ok(ADMIN_PRIVS)
+        if (method, path) == ("GET", "/access/roles"):
+            return ok([{"roleid": r} for r in self.roles])
+        if (method, path) == ("GET", "/access/users"):
+            return ok([{"userid": u} for u in ["root@pam", *self.users]])
+        if (method, path) == ("GET", "/access/users/hisho%40pve/token"):
+            return ok([{"tokenid": t} for t in self.tokens])
+        if method == "POST" and path.startswith("/access/users/hisho%40pve/token/"):
+            name = path.rsplit("/", 1)[1]
+            return ok({"full-tokenid": f"hisho@pve!{name}", "value": "1111-2222-secret", "info": {"privsep": 0}})
+        return ok(None)
+
+    def writes(self):
+        return [(m, p, prm) for m, p, prm, _ in self.calls if m in ("POST", "PUT") and p != "/access/ticket"]
+
+
+@pytest.fixture
+def pve(monkeypatch, addon):
+    mod = addons.provider(addon)
+    fake = FakePVE()
+    monkeypatch.setattr(mod, "_learn_fingerprint", lambda host, port: "AA:BB")
+    monkeypatch.setattr(mod, "_send", fake)
+    return mod, fake
+
+
+def test_found_on_your_network_looks_for_proxmoxs_sign_in_page(addon):
+    from hisho import connect as hconnect
+    [probe] = addon.manifest["discover"]
+    assert probe["http"] == "https://{ip}:8006/" and probe["fill"] == {"url": "{ip}"}
+    tcp = lambda ip, port, banner="": port == 8006 and ip == "192.0.2.10"
+    http = lambda url, match: url == "https://192.0.2.10:8006/" and "Proxmox Virtual Environment" in match
+    got = hconnect.scan(addon, ["192.0.2.0/28"], tcp=tcp, http=http, rmcp=lambda *a: False, workers=2)
+    assert got == [{"ip": "192.0.2.10", "title": "Proxmox at 192.0.2.10", "fill": {"url": "192.0.2.10"}}]
+    assert addon.manifest["connect"]["form"] == ["url"]
+    assert set(addon.manifest["connect"]["fields"]) == {"user", "password"}
+
+
+def test_sign_in_once_makes_hishos_own_user_roles_and_token(pve):
+    mod, fake = pve
+    out = mod.connect({"url": "192.0.2.10", "user": "root", "password": "right-pass"}, None)
+    assert out["ok"]
+    assert out["entry"] == {"url": "192.0.2.10", "token_id": "hisho@pve!hisho", "token_secret": "1111-2222-secret",
+                            "fingerprint": "AA:BB"}
+    assert fake.calls[0][2] == {"username": "root@pam", "password": "right-pass"}   # a bare root means root@pam
+    w = fake.writes()
+    roles = {prm["roleid"]: prm["privs"].split(",") for m, p, prm in w if p == "/access/roles"}
+    assert roles["Hisho"] == ["VM.Audit", "VM.PowerMgmt", "Sys.Audit", "Sys.PowerMgmt"]
+    assert "Sys.Modify" in roles["HishoCreate"] and "SDN.Use" not in roles["HishoCreate"]   # not on this Proxmox
+    assert not any("Permissions" in x or "User" in x or "Sys.Console" == x for r in roles.values() for x in r)
+    assert ("POST", "/access/users", {"userid": "hisho@pve", "comment": w[2][2]["comment"]}) in w
+    assert ("PUT", "/access/acl", {"path": "/", "users": "hisho@pve", "roles": "Hisho,HishoCreate", "propagate": 1}) in w
+    assert w[-1][1] == "/access/users/hisho%40pve/token/hisho" and w[-1][2]["privsep"] == 0
+    assert "right-pass" not in json.dumps(out) and "user hisho@pve" in out["message"]
+
+
+def test_sign_in_once_reuses_hishos_user_and_makes_a_new_token_name(pve):
+    mod, fake = pve
+    fake.users, fake.tokens, fake.roles = ["hisho@pve"], ["hisho"], ["Administrator", "Hisho", "HishoCreate"]
+    out = mod.connect({"url": "192.0.2.10", "user": "root@pam", "password": "right-pass"}, None)
+    import time
+    day = time.strftime("%Y%m%d")
+    assert out["entry"]["token_id"] == f"hisho@pve!hisho-{day}"
+    paths = [(m, p) for m, p, _ in fake.writes()]
+    assert ("POST", "/access/users") not in paths and ("POST", "/access/roles") not in paths
+    assert ("PUT", "/access/roles/Hisho") in paths and ("PUT", "/access/roles/HishoCreate") in paths   # kept current
+    assert mod._token_name({"hisho", f"hisho-{day}"}) == f"hisho-{day}-2"
+
+
+def test_a_wrong_password_says_so_without_the_password(pve):
+    mod, fake = pve
+    with pytest.raises(mod.ConnectError) as e:
+        mod.connect({"url": "192.0.2.10", "user": "root@pam", "password": "wrong-pass"}, None)
+    assert "refused the sign-in for root@pam" in str(e.value) and "wrong-pass" not in str(e.value)
+    assert fake.writes() == []                               # nothing made
+
+
+def test_two_factor_and_an_unreachable_server_are_said_plainly(monkeypatch, addon):
+    mod = addons.provider(addon)
+    monkeypatch.setattr(mod, "_learn_fingerprint", lambda h, p: (_ for _ in ()).throw(ConnectionRefusedError()))
+    with pytest.raises(mod.ConnectError, match="can't reach 192.0.2.10:8006"):
+        mod.connect({"url": "192.0.2.10", "user": "root@pam", "password": "x"}, None)
+    monkeypatch.setattr(mod, "_learn_fingerprint", lambda h, p: "AA:BB")
+    monkeypatch.setattr(mod, "_send", lambda *a: (200, json.dumps({"data": {"ticket": "t", "NeedTFA": 1}})))
+    with pytest.raises(mod.ConnectError, match="two-factor"):
+        mod.connect({"url": "192.0.2.10", "user": "root@pam", "password": "x"}, None)
+
+
+def test_sign_in_once_through_core_tests_and_saves_the_token(fleet, pve, monkeypatch, tmp_path):
+    from hisho import connect as hconnect
+    monkeypatch.setattr(addons, "LOCAL_SECRETS", str(tmp_path / "secrets.env"))
+    mod, fake = pve
+    seen = []
+
+    class FakeAPI:
+        def __init__(self, url, token, fingerprint=None, timeout=8):
+            seen.append((url, token, fingerprint))
+        def get(self, path, **kw):
+            return [{"node": "pve1", "status": "online"}] if path == "/nodes" else []
+    monkeypatch.setattr("hisho.proxmox_create.ProxmoxAPI", FakeAPI)
+    px = addons.get("proxmox")
+    out = hconnect.connect(px, "pve1", {"url": "192.0.2.10", "user": "root@pam", "password": "right-pass"})
+    assert out["ok"], out
+    assert seen[-1] == ("https://192.0.2.10:8006", "hisho@pve!hisho=1111-2222-secret", "AA:BB")
+    e = addons.read_config("proxmox")["entries"]["pve1"]
+    assert e["token_id"] == "hisho@pve!hisho" and e["fingerprint"] == "AA:BB" and "password" not in e
+    assert "1111-2222-secret" not in Path(addons.config_path("proxmox")).read_text()

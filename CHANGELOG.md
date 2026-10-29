@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.0
+
+- Found on your network: the page lists the Proxmox servers it sees (their sign-in page on port 8006), with Use this.
+- Sign in once: type an admin login (e.g. root@pam) once and Hisho makes its own user hisho@pve, roles Hisho (see and
+  power VMs, clean server shutdown) and HishoCreate (Core's "add a machine") and an API token; the password is not kept.
+  An existing user is reused and a token name in use gets a dated name. Two-factor admins are told to make the token by hand.
+- Setup help says to use Sign in once instead of making a token by hand.
+
 ## 0.5.2
 
 - Every field on its setup form says in plain words what it is, and links to where to get it (addon.yaml `help:`, shown by Hisho's dashboard).

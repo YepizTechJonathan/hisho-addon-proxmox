@@ -1,17 +1,19 @@
 # Proxmox VE integration: one entry per Proxmox server. Shows each server's state and the
 # VMs and containers on it, and starts or shuts them down. Add a server from its dashboard page:
-# in Proxmox, Datacenter > Permissions > API Tokens > Add (user root@pam, Token ID e.g. "hisho",
-# untick Privilege Separation); it then shows "Token ID" (root@pam!hisho) and "Secret" once.
-# Paste both and press Add: Hisho tests the connection first and remembers the certificate.
+# Found on your network lists the Proxmox servers it sees; Use this, then Sign in once with an admin
+# (root@pam). Hisho makes its own user hisho@pve (roles Hisho and HishoCreate, see provider.ROLES) and an
+# API token for it; the admin password is used once and not kept. Or fill in every field yourself with a
+# token made by hand (Datacenter > Permissions > API Tokens). Hisho tests the connection and remembers
+# the certificate.
 name: proxmox
 kind: integration
 secret_rotate: Proxmox > Datacenter > Permissions > API Tokens (remove and add the token again)
 title: Proxmox
 description: Your Proxmox servers, their VMs and containers, with start and shutdown, CPU temperatures, a clean server shutdown, and Hisho's updates for each server with an "update now" button.
-version: 0.5.2
+version: 0.6.0
 you_need:
   - "A Proxmox VE server you can reach from the Core machine"
-  - "A Proxmox API token (Datacenter > Permissions > API Tokens)"
+  - "Its admin login (e.g. root@pam) once, so Hisho can make its own limited user and token; or a Proxmox API token made by hand"
 provider: provider.py
 entry_form:                # what the page asks for
   url: "IP address (or full URL if you changed Proxmox's port)"
@@ -19,6 +21,13 @@ entry_form:                # what the page asks for
   token_secret: "Secret (paste it, or its secret's name in Bitwarden)"
   note: "Note"
 entry_label: Proxmox server
+discover:                  # Found on your network: Proxmox's sign-in page on port 8006
+  - {http: "https://{ip}:8006/", match: "Proxmox Virtual Environment", title: "Proxmox at {ip}", fill: {url: "{ip}"}}
+connect:                   # Sign in once: provider.connect makes user hisho@pve and its token
+  label: Sign in once
+  say: "Hisho signs in once to make its own user (hisho@pve) and API token, with only what it needs. Your password is not kept."
+  form: [url]
+  fields: {user: "Admin user (e.g. root@pam)", password: "Admin password"}
 entry_schema:
   url: str                 # IP or name (https and port 8006 assumed), or a full URL if changed
   token_id: "str?"         # as Proxmox shows it, e.g. root@pam!hisho (or a secret's name holding it)
@@ -31,17 +40,17 @@ entry_schema:
 help:
   url:
     label: Proxmox address
-    say: "The address you open Proxmox at, like 192.0.2.10. Just the IP is enough: Hisho assumes https and port 8006. Type the full address only if you changed the port."
+    say: "The address you open Proxmox at, like 192.0.2.10. Found on your network fills it in. Just the IP is enough: Hisho assumes https and port 8006. Type the full address only if you changed the port."
     get: "https://pve.proxmox.com/pve-docs/chapter-pve-gui.html"
     get_label: About the Proxmox web page
   token_id:
     label: Token ID
-    say: "Make it in Proxmox under Datacenter > Permissions > API Tokens > Add: user root@pam, Token ID hisho, and untick Privilege Separation so it can start and stop VMs. Proxmox then shows the Token ID, like root@pam!hisho."
+    say: "Easiest: use Sign in once above, and Hisho makes its own user and token. By hand: in Proxmox, Datacenter > Permissions > API Tokens > Add, for a user that may start and stop VMs, and untick Privilege Separation. Proxmox then shows the Token ID, like hisho@pve!hisho."
     get: "https://pve.proxmox.com/pve-docs/chapter-pveum.html#pveum_tokens"
     get_label: How to make an API token
   token_secret:
     label: Token secret
-    say: "The Secret Proxmox shows next to the Token ID. It is shown only once, right after you make the token: copy it then."
+    say: "Not needed with Sign in once. By hand: the Secret Proxmox shows next to the Token ID. It is shown only once, right after you make the token: copy it then."
     get: "https://pve.proxmox.com/pve-docs/chapter-pveum.html#pveum_tokens"
     get_label: How to make an API token
   note:
