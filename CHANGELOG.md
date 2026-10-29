@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.7.0
+
+- Safe next to another Hisho: Sign in once names everything after the machine Hisho runs on (user
+  `hisho-<machine>@pve`, roles `Hisho-<machine>` and `HishoCreate-<machine>`, token `hisho`) and only makes new
+  things: a name already taken gets the next free suffix (-2, -3...) on all three, and no existing user, role, token
+  or permission is changed or reused any more (0.6.0 reused `hisho@pve` and rewrote the roles `Hisho` and
+  `HishoCreate`). The entry records what was made (`made`, names only); a sign-in that fails halfway deletes what it
+  had just made.
+- Remove from Proxmox: on an entry made by Sign in once, the admin login once more deletes exactly what it made (the
+  token, that user's permissions, the user, and its roles unless someone else is given them), checking the
+  server's remembered certificate first; already-gone items are said, not an error. Then Hisho forgets the entry.
+
 ## 0.6.0
 
 - Found on your network: the page lists the Proxmox servers it sees (their sign-in page on port 8006), with Use this.

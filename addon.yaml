@@ -1,32 +1,37 @@
 # Proxmox VE integration: one entry per Proxmox server. Shows each server's state and the
 # VMs and containers on it, and starts or shuts them down. Add a server from its dashboard page:
 # Found on your network lists the Proxmox servers it sees; Use this, then Sign in once with an admin
-# (root@pam). Hisho makes its own user hisho@pve (roles Hisho and HishoCreate, see provider.ROLES) and an
-# API token for it; the admin password is used once and not kept. Or fill in every field yourself with a
-# token made by hand (Datacenter > Permissions > API Tokens). Hisho tests the connection and remembers
+# (root@pam). Hisho makes its own user hisho-<machine>@pve (roles Hisho-<machine> and HishoCreate-<machine>, see
+# provider.ROLES; a name in use gets -2, -3...) and an API token for it; the admin password is used once and not kept.
+# Remove from Proxmox (same admin login once) deletes exactly what Sign in once made (entry field made).
+# Or fill in every field yourself with a token made by hand (Datacenter > Permissions > API Tokens). Hisho tests the connection and remembers
 # the certificate.
 name: proxmox
 kind: integration
 secret_rotate: Proxmox > Datacenter > Permissions > API Tokens (remove and add the token again)
 title: Proxmox
 description: Your Proxmox servers, their VMs and containers, with start and shutdown, CPU temperatures, a clean server shutdown, and Hisho's updates for each server with an "update now" button.
-version: 0.6.0
+version: 0.7.0
 you_need:
   - "A Proxmox VE server you can reach from the Core machine"
-  - "Its admin login (e.g. root@pam) once, so Hisho can make its own limited user and token; or a Proxmox API token made by hand"
+  - "Its admin login (e.g. root@pam) once, so Hisho can make its own limited user and token (and once more if you remove it); or a Proxmox API token made by hand"
 provider: provider.py
 entry_form:                # what the page asks for
   url: "IP address (or full URL if you changed Proxmox's port)"
-  token_id: "Token ID (e.g. hisho@pve!hisho), or its secret's name in Bitwarden"
+  token_id: "Token ID (e.g. hisho-kihon@pve!hisho), or its secret's name in Bitwarden"
   token_secret: "Secret (paste it, or its secret's name in Bitwarden)"
   note: "Note"
 entry_label: Proxmox server
 discover:                  # Found on your network: Proxmox's sign-in page on port 8006
   - {http: "https://{ip}:8006/", match: "Proxmox Virtual Environment", title: "Proxmox at {ip}", fill: {url: "{ip}"}}
-connect:                   # Sign in once: provider.connect makes user hisho@pve and its token
+connect:                   # Sign in once: provider.connect makes user hisho-<machine>@pve, its roles and token
   label: Sign in once
-  say: "Hisho signs in once to make its own user (hisho@pve) and API token, with only what it needs. Your password is not kept."
+  say: "Hisho signs in once to make its own user (hisho-<this machine>@pve), roles and API token, with only what it needs. It changes nothing that is already there. Your password is not kept."
   form: [url]
+  fields: {user: "Admin user (e.g. root@pam)", password: "Admin password"}
+disconnect:                # Remove from Proxmox: provider.disconnect deletes exactly what made lists
+  label: Remove from Proxmox
+  say: "Hisho signs in once more to delete only what it made for this server: its token, its user and its roles (a role someone else is given stays). Your password is not kept."
   fields: {user: "Admin user (e.g. root@pam)", password: "Admin password"}
 entry_schema:
   url: str                 # IP or name (https and port 8006 assumed), or a full URL if changed
@@ -37,6 +42,7 @@ entry_schema:
   note: "str?"
   thermal_ssh: "str?"      # user@host whose authorized_keys forces `hisho-thermal-guard print` for Core's key
   thermal_key: "str?"      # Core's private key for that (default ~/.ssh/hisho_thermal_ed25519)
+  made: "map?"             # what Sign in once made (user, roles, tokens, acl paths; names only), for Remove from Proxmox
 help:
   url:
     label: Proxmox address
@@ -45,7 +51,7 @@ help:
     get_label: About the Proxmox web page
   token_id:
     label: Token ID
-    say: "Easiest: use Sign in once above, and Hisho makes its own user and token. By hand: in Proxmox, Datacenter > Permissions > API Tokens > Add, for a user that may start and stop VMs, and untick Privilege Separation. Proxmox then shows the Token ID, like hisho@pve!hisho."
+    say: "Easiest: use Sign in once above, and Hisho makes its own user and token. By hand: in Proxmox, Datacenter > Permissions > API Tokens > Add, for a user that may start and stop VMs, and untick Privilege Separation. Proxmox then shows the Token ID, like hisho-kihon@pve!hisho."
     get: "https://pve.proxmox.com/pve-docs/chapter-pveum.html#pveum_tokens"
     get_label: How to make an API token
   token_secret:

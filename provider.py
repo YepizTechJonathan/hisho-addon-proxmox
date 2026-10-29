@@ -8,7 +8,6 @@ import os
 import re
 import ssl
 import subprocess
-import time
 import urllib.parse
 from typing import Any
 
@@ -389,12 +388,13 @@ def act(entries: dict[str, dict[str, Any]], ctx: Any, entry: str, item: str, act
 
 # ── sign in once: Hisho makes its own user and token ─────────────────────
 
-#: What Hisho's own user ``hisho@pve`` may do, as two roles on ``/`` so either can be taken away on its own
-#: (Datacenter > Permissions). ``Hisho``: see the servers, VMs and containers, start and shut them down, shut a
-#: server down cleanly. ``HishoCreate``: make a new machine (Core's "add a machine": put Ubuntu's image on a
-#: storage, create the VM, grow its disk); ``Sys.Modify`` is what Proxmox asks for to download the image.
+#: What Hisho's own user may do, as two roles on ``/`` so either can be taken away on its own
+#: (Datacenter > Permissions). ``Hisho-<machine>``: see the servers, VMs and containers, start and shut them down,
+#: shut a server down cleanly. ``HishoCreate-<machine>``: make a new machine (Core's "add a machine": put Ubuntu's
+#: image on a storage, create the VM, grow its disk); ``Sys.Modify`` is what Proxmox asks for to download the image.
 #: Neither role can change users or permissions, open a shell or console on the server, or touch backups.
-HISHO_USER = "hisho@pve"
+#: Every name carries the machine Hisho runs on (user ``hisho-<machine>@pve``), so a second Hisho never touches
+#: another one's user, roles or token: a name already taken gets a free numeric suffix (-2, -3...) instead.
 ROLES = {
     "Hisho": ["VM.Audit", "VM.PowerMgmt", "Sys.Audit", "Sys.PowerMgmt"],
     "HishoCreate": ["VM.Allocate", "VM.Audit", "VM.PowerMgmt", "VM.Console", "VM.Config.Disk", "VM.Config.CDROM",
@@ -402,10 +402,28 @@ ROLES = {
                     "VM.Config.Options", "VM.Config.HWType", "Datastore.AllocateSpace", "Datastore.AllocateTemplate",
                     "Datastore.Audit", "Sys.Audit", "Sys.Modify", "SDN.Use"],
 }
+TOKEN = "hisho"
 
 
 class ConnectError(RuntimeError):
     pass
+
+
+def _machine() -> str:
+    """This machine's name for the names Hisho makes (lower-case letters, digits and dashes)."""
+    try:
+        from hisho import fleet_config
+        name = fleet_config.local_name()
+    except Exception:  # noqa: BLE001
+        import socket
+        name = socket.gethostname()
+    return re.sub(r"[^a-z0-9-]+", "-", str(name).split(".")[0].lower()).strip("-")[:40].strip("-") or "hisho"
+
+
+def names_for(machine: str, n: int = 1) -> dict[str, Any]:
+    """The user and roles Hisho makes from ``machine``, the n-th try (n > 1 adds ``-n``)."""
+    tail = machine if n == 1 else f"{machine}-{n}"
+    return {"user": f"hisho-{tail}@pve", "roles": {f"{role}-{tail}": role for role in ROLES}}
 
 
 def _learn_fingerprint(host: str, port: int) -> str:
@@ -439,10 +457,15 @@ def _send(host: str, port: int, fingerprint: str, method: str, path: str, params
         conn.close()
 
 
-class AdminSession:
-    """Signed in with the admin login the owner typed (a ticket; the password is sent once and kept nowhere)."""
+def _same_fp(a: str, b: str) -> bool:
+    return a.replace(":", "").lower() == b.replace(":", "").lower()
 
-    def __init__(self, url: str, user: str, password: str) -> None:
+
+class AdminSession:
+    """Signed in with the admin login the owner typed (a ticket; the password is sent once and kept nowhere).
+    ``pinned``: the certificate the entry remembers; a server showing another one is refused before signing in."""
+
+    def __init__(self, url: str, user: str, password: str, pinned: str | None = None) -> None:
         from hisho.proxmox_create import split_url
         self.host, self.port = split_url(server_url(url))
         try:
@@ -450,6 +473,9 @@ class AdminSession:
         except OSError as exc:
             raise ConnectError(f"can't reach {self.host}:{self.port} ({type(exc).__name__}); check the address "
                                "and that the server is on") from None
+        if pinned and not _same_fp(pinned, self.fingerprint):
+            raise ConnectError(f"{self.host}'s certificate is not the one Hisho remembers; Hisho stopped before "
+                               "sending your login")
         user = str(user or "").strip()
         if not user:
             raise ConnectError("type the admin user, e.g. root@pam")
@@ -487,44 +513,123 @@ def _role_privs(s: AdminSession) -> dict[str, str]:
     return {role: ",".join(p for p in privs if not have or p in have) for role, privs in ROLES.items()}
 
 
-def _token_name(existing: set[str]) -> str:
-    name = "hisho"
-    if name in existing:
-        name = f"hisho-{time.strftime('%Y%m%d')}"
-        n = 2
-        while name in existing:
-            name, n = f"hisho-{time.strftime('%Y%m%d')}-{n}", n + 1
-    return name
+def _free_names(s: AdminSession, machine: str) -> dict[str, Any]:
+    """The first names (user and both roles) none of which exist on this Proxmox yet."""
+    roles = {str(r.get("roleid")) for r in s.call("GET", "/access/roles") or []}
+    users = {str(u.get("userid")) for u in s.call("GET", "/access/users") or []}
+    for n in range(1, 100):
+        got = names_for(machine, n)
+        if got["user"] not in users and not set(got["roles"]) & roles:
+            return got
+    raise ConnectError(f"every Hisho name for {machine} is taken on this Proxmox (hisho-{machine}-2 to -99)")
 
 
 def connect(values: dict[str, Any], ctx: Any) -> dict[str, Any]:
-    """Sign in once with an admin login, then make Hisho's own access: user hisho@pve with the roles in ROLES on
-    ``/`` and an API token that has exactly the user's rights. Returns the entry (address, token, certificate)."""
+    """Sign in once with an admin login, then make Hisho's own access: user ``hisho-<machine>@pve`` with the
+    roles ``Hisho-<machine>`` and ``HishoCreate-<machine>`` on ``/`` and an API token ``hisho`` that has exactly
+    the user's rights. Only new things are made, nothing on the server is changed; ``made`` in the entry lists
+    them (names only) for Remove from Proxmox. Returns the entry (address, token, certificate, made)."""
     s = AdminSession(str(values.get("url") or ""), str(values.get("user") or ""), str(values.get("password") or ""))
-    made = []
-    roles = {r.get("roleid") for r in s.call("GET", "/access/roles") or []}
-    for role, privs in _role_privs(s).items():
-        if role in roles:
-            s.call("PUT", f"/access/roles/{role}", privs=privs)
-        else:
-            s.call("POST", "/access/roles", roleid=role, privs=privs)
-            made.append(f"role {role}")
-    users = {u.get("userid") for u in s.call("GET", "/access/users") or []}
-    if HISHO_USER not in users:
-        s.call("POST", "/access/users", userid=HISHO_USER,
+    names = _free_names(s, _machine())
+    user, quoted = names["user"], urllib.parse.quote(names["user"], safe="")
+    made: dict[str, Any] = {"user": None, "roles": [], "tokens": [], "acl": []}
+    privs = _role_privs(s)
+    try:
+        for role, base in names["roles"].items():
+            s.call("POST", "/access/roles", roleid=role, privs=privs[base])
+            made["roles"].append(role)
+        s.call("POST", "/access/users", userid=user,
                comment="Hisho: sees and powers VMs, makes new machines. Token only, no password.")
-        made.insert(0, f"user {HISHO_USER}")
-    s.call("PUT", "/access/acl", path="/", users=HISHO_USER, roles=",".join(ROLES), propagate=1)
-    quoted = urllib.parse.quote(HISHO_USER, safe="")
-    tokens = {t.get("tokenid") for t in s.call("GET", f"/access/users/{quoted}/token") or []}
-    name = _token_name(tokens)
-    got = s.call("POST", f"/access/users/{quoted}/token/{name}", privsep=0,
-                 comment=f"Hisho, made by signing in once as {s.user}") or {}
-    if not got.get("value"):
-        raise ConnectError("Proxmox made the token but did not show its secret; try again")
-    made.append(f"token {name}")
+        made["user"] = user
+        s.call("PUT", "/access/acl", path="/", users=user, roles=",".join(names["roles"]), propagate=1)
+        made["acl"].append("/")
+        got = s.call("POST", f"/access/users/{quoted}/token/{TOKEN}", privsep=0,
+                     comment=f"Hisho, made by signing in once as {s.user}") or {}
+        made["tokens"].append(TOKEN)
+        if not got.get("value"):
+            raise ConnectError("Proxmox made the token but did not show its secret; try again")
+    except Exception as exc:
+        try:
+            undone = "Hisho undid what it had made: " + _undo(s, made)
+        except Exception as again:  # noqa: BLE001
+            undone = f"and could not undo what it had made ({again}): {made}"
+        raise ConnectError(f"{exc} ({undone})") from None
     return {"ok": True,
-            "entry": {"url": str(values.get("url") or "").strip(), "token_id": got.get("full-tokenid") or f"{HISHO_USER}!{name}",
-                      "token_secret": got["value"], "fingerprint": s.fingerprint},
-            "message": f"Made {', '.join(made)} on {s.host}: Hisho can see and power your VMs and make new machines, "
-                       "nothing more. Your admin password was used once and not kept."}
+            "entry": {"url": str(values.get("url") or "").strip(),
+                      "token_id": got.get("full-tokenid") or f"{user}!{TOKEN}",
+                      "token_secret": got["value"], "fingerprint": s.fingerprint, "made": made},
+            "message": f"Made user {user}, roles {' and '.join(made['roles'])} and token {TOKEN} on {s.host}: Hisho "
+                       "can see and power your VMs and make new machines, nothing more. Nothing that was there "
+                       "before was changed. Your admin password was used once and not kept."}
+
+
+# ── Remove from Proxmox: delete exactly what Sign in once made ────────────
+
+def _undo(s: AdminSession, made: dict[str, Any]) -> str:
+    """Delete what ``made`` lists, in reverse (tokens, the user's permissions, the user, then its roles if no one
+    else uses them). Items already gone are fine. Returns what happened, in plain words."""
+    done, gone, kept = [], [], []
+    user = str(made.get("user") or "")
+    if user and not (user.startswith("hisho-") and user.endswith("@pve")):
+        raise ConnectError(f"{user} is not a user Hisho makes; Hisho deletes only hisho-<machine>@pve")
+    bad = [r for r in made.get("roles") or [] if not str(r).startswith(tuple(f"{b}-" for b in ROLES))]
+    if bad:
+        raise ConnectError(f"role {bad[0]} is not one Hisho makes; nothing was deleted")
+    quoted = urllib.parse.quote(user, safe="")
+    users = {str(u.get("userid")) for u in s.call("GET", "/access/users") or []} if user else set()
+    if user and user in users:
+        have = {str(t.get("tokenid")) for t in s.call("GET", f"/access/users/{quoted}/token") or []}
+        for t in made.get("tokens") or []:
+            if t in have:
+                s.call("DELETE", f"/access/users/{quoted}/token/{t}")
+                done.append(f"token {t}")
+            else:
+                gone.append(f"token {t}")
+        for a in s.call("GET", "/access/acl") or []:
+            ugid = str(a.get("ugid") or "")
+            if ugid == user and a.get("type") == "user":
+                s.call("PUT", "/access/acl", path=a.get("path"), users=user, roles=a.get("roleid"), delete=1)
+            elif ugid.startswith(user + "!") and a.get("type") == "token":
+                s.call("PUT", "/access/acl", path=a.get("path"), tokens=ugid, roles=a.get("roleid"), delete=1)
+            else:
+                continue
+            if f"permissions of {user}" not in done:
+                done.append(f"permissions of {user}")
+        s.call("DELETE", f"/access/users/{quoted}")
+        done.append(f"user {user}")
+    elif user:
+        gone.append(f"user {user}")
+    if made.get("roles"):
+        roles = {str(r.get("roleid")) for r in s.call("GET", "/access/roles") or []}
+        used = {str(a.get("roleid")) for a in s.call("GET", "/access/acl") or []}
+        for r in made["roles"]:
+            if r not in roles:
+                gone.append(f"role {r}")
+            elif r in used:
+                kept.append(f"role {r} (still given to someone)")
+            else:
+                s.call("DELETE", f"/access/roles/{r}")
+                done.append(f"role {r}")
+    parts = []
+    if done:
+        parts.append("deleted " + ", ".join(done))
+    if gone:
+        parts.append("already gone: " + ", ".join(gone))
+    if kept:
+        parts.append("kept " + ", ".join(kept))
+    return "; ".join(parts) or "nothing to delete"
+
+
+def disconnect(entry: dict[str, Any], login: dict[str, Any], ctx: Any) -> dict[str, Any]:
+    """Remove from Proxmox: sign in once with an admin login (over the certificate the entry remembers) and delete
+    exactly what Sign in once made for this entry (``made``): its token, its permissions, its user, and its roles
+    when no one else is given them. Nothing else on the server is touched."""
+    made = entry.get("made") or {}
+    if not isinstance(made, dict) or not (made.get("user") or made.get("roles")):
+        return {"ok": False, "error": "Hisho didn't make this entry's access by signing in once, so there is "
+                                      "nothing of Hisho's to remove; remove the token in Proxmox yourself"}
+    s = AdminSession(str(entry.get("url") or ""), str(login.get("user") or ""), str(login.get("password") or ""),
+                     pinned=str(entry.get("fingerprint") or "") or None)
+    said = _undo(s, made)
+    return {"ok": True, "message": f"On {s.host}: {said}. Nothing else was touched. Your admin password was used "
+                                   "once and not kept."}

@@ -251,6 +251,7 @@ def test_no_update_button_while_an_update_runs(fleet, monkeypatch, tmp_path):
 # ── Find it and Sign in once ──────────────────────────────────────────────
 
 import json
+import urllib.parse
 
 import pytest
 
@@ -260,38 +261,88 @@ ADMIN_PRIVS = {p: 1 for p in ("VM.Audit", "VM.PowerMgmt", "VM.Allocate", "VM.Con
                               "Datastore.AllocateTemplate", "Datastore.Audit", "Sys.Audit", "Sys.Modify", "Sys.PowerMgmt",
                               "Permissions.Modify")}   # no SDN.Use on this (pretend) older Proxmox
 
+#: what a live Hisho already has on this Proxmox: its own user, roles, token and permission
+LIVE = {"users": ["hisho@pve"], "roles": ["Hisho", "HishoCreate"], "tokens": {"hisho@pve": ["hisho"]},
+        "acl": [{"path": "/", "type": "user", "ugid": "hisho@pve", "roleid": "Hisho", "propagate": 1},
+                {"path": "/", "type": "user", "ugid": "hisho@pve", "roleid": "HishoCreate", "propagate": 1}]}
+
 
 class FakePVE:
-    """A Proxmox API in memory: what Hisho's sign-in sends, and what it answers."""
+    """A Proxmox API in memory: users, roles, tokens and permissions, what Hisho sends and what it answers."""
 
-    def __init__(self, password="right-pass", users=(), tokens=(), roles=("Administrator", "PVEAuditor")):
-        self.password, self.users, self.tokens, self.roles = password, list(users), list(tokens), list(roles)
+    def __init__(self, password="right-pass", users=(), tokens=None, roles=(), acl=()):
+        self.password = password
+        self.users = ["root@pam", *users]
+        self.roles = ["Administrator", "PVEAuditor", *roles]
+        self.tokens = {u: list(t) for u, t in (tokens or {}).items()}
+        self.acl = [dict(a) for a in acl]
         self.calls = []
+        self.fail = None                       # (method, path) that answers 500
 
     def __call__(self, host, port, fingerprint, method, path, params, headers):
         self.calls.append((method, path, dict(params), dict(headers)))
         assert fingerprint == "AA:BB" and host == "192.0.2.10" and port == 8006
-        ok = lambda data: (200, json.dumps({"data": data}))
+        ok = lambda data=None: (200, json.dumps({"data": data}))
         if path == "/access/ticket":
             if params["password"] != self.password:
                 return 401, '{"data":null}'
             return ok({"ticket": "PVE:root@pam:TICKET", "CSRFPreventionToken": "CSRF1", "username": params["username"]})
         assert headers["Cookie"] == "PVEAuthCookie=PVE:root@pam:TICKET" and headers["CSRFPreventionToken"] == "CSRF1"
+        if self.fail == (method, path):
+            return 500, '{"data":null,"message":"boom"}'
+        parts = path.split("/")
         if (method, path) == ("GET", "/access/roles/Administrator"):
             return ok(ADMIN_PRIVS)
-        if (method, path) == ("GET", "/access/roles"):
+        if path == "/access/roles":
+            if method == "POST":
+                assert params["roleid"] not in self.roles, "a role that exists was created again"
+                self.roles.append(params["roleid"])
+                return ok()
             return ok([{"roleid": r} for r in self.roles])
-        if (method, path) == ("GET", "/access/users"):
-            return ok([{"userid": u} for u in ["root@pam", *self.users]])
-        if (method, path) == ("GET", "/access/users/hisho%40pve/token"):
-            return ok([{"tokenid": t} for t in self.tokens])
-        if method == "POST" and path.startswith("/access/users/hisho%40pve/token/"):
-            name = path.rsplit("/", 1)[1]
-            return ok({"full-tokenid": f"hisho@pve!{name}", "value": "1111-2222-secret", "info": {"privsep": 0}})
-        return ok(None)
+        if path.startswith("/access/roles/") and method == "DELETE":
+            self.roles.remove(parts[3])
+            return ok()
+        if path == "/access/users":
+            if method == "POST":
+                assert params["userid"] not in self.users, "a user that exists was created again"
+                self.users.append(params["userid"])
+                return ok()
+            return ok([{"userid": u} for u in self.users])
+        if path == "/access/acl":
+            if method == "GET":
+                return ok(self.acl)
+            kind, ugid = ("token", params["tokens"]) if "tokens" in params else ("user", params["users"])
+            for role in str(params["roles"]).split(","):
+                row = {"path": params["path"], "type": kind, "ugid": ugid, "roleid": role}
+                if params.get("delete"):
+                    self.acl = [a for a in self.acl if {k: a[k] for k in row} != row]
+                else:
+                    self.acl.append({**row, "propagate": params.get("propagate", 1)})
+            return ok()
+        if path.startswith("/access/users/"):
+            user = urllib.parse.unquote(parts[3])
+            if user not in self.users:
+                return 500, '{"data":null}'
+            if len(parts) == 4 and method == "DELETE":
+                self.users.remove(user)
+                self.tokens.pop(user, None)
+                self.acl = [a for a in self.acl if a["ugid"] != user]
+                return ok()
+            if parts[4:] == ["token"] and method == "GET":
+                return ok([{"tokenid": t} for t in self.tokens.get(user, [])])
+            if len(parts) == 6 and parts[4] == "token":
+                name = parts[5]
+                if method == "POST":
+                    assert name not in self.tokens.get(user, []), "a token that exists was made again"
+                    self.tokens.setdefault(user, []).append(name)
+                    return ok({"full-tokenid": f"{user}!{name}", "value": "1111-2222-secret", "info": {"privsep": 0}})
+                if method == "DELETE":
+                    self.tokens[user].remove(name)
+                    return ok()
+        raise AssertionError(f"unexpected {method} {path}")
 
     def writes(self):
-        return [(m, p, prm) for m, p, prm, _ in self.calls if m in ("POST", "PUT") and p != "/access/ticket"]
+        return [(m, p, prm) for m, p, prm, _ in self.calls if m in ("POST", "PUT", "DELETE") and p != "/access/ticket"]
 
 
 @pytest.fixture
@@ -300,6 +351,7 @@ def pve(monkeypatch, addon):
     fake = FakePVE()
     monkeypatch.setattr(mod, "_learn_fingerprint", lambda host, port: "AA:BB")
     monkeypatch.setattr(mod, "_send", fake)
+    monkeypatch.setattr("hisho.fleet_config.local_name", lambda: "Test_Box")    # this machine: test-box
     return mod, fake
 
 
@@ -313,37 +365,127 @@ def test_found_on_your_network_looks_for_proxmoxs_sign_in_page(addon):
     assert got == [{"ip": "192.0.2.10", "title": "Proxmox at 192.0.2.10", "fill": {"url": "192.0.2.10"}}]
     assert addon.manifest["connect"]["form"] == ["url"]
     assert set(addon.manifest["connect"]["fields"]) == {"user", "password"}
+    assert set(addon.manifest["disconnect"]["fields"]) == {"user", "password"}
+    assert addon.manifest["entry_schema"]["made"] == "map?"
 
 
-def test_sign_in_once_makes_hishos_own_user_roles_and_token(pve):
+MADE = {"user": "hisho-test-box@pve", "roles": ["Hisho-test-box", "HishoCreate-test-box"], "tokens": ["hisho"],
+        "acl": ["/"]}
+
+
+def test_sign_in_once_makes_its_own_user_roles_and_token_named_after_this_machine(pve):
     mod, fake = pve
     out = mod.connect({"url": "192.0.2.10", "user": "root", "password": "right-pass"}, None)
     assert out["ok"]
-    assert out["entry"] == {"url": "192.0.2.10", "token_id": "hisho@pve!hisho", "token_secret": "1111-2222-secret",
-                            "fingerprint": "AA:BB"}
+    assert out["entry"] == {"url": "192.0.2.10", "token_id": "hisho-test-box@pve!hisho", "token_secret": "1111-2222-secret",
+                            "fingerprint": "AA:BB", "made": MADE}
+    assert "1111" not in json.dumps(out["entry"]["made"])                   # names only, never the secret
     assert fake.calls[0][2] == {"username": "root@pam", "password": "right-pass"}   # a bare root means root@pam
     w = fake.writes()
     roles = {prm["roleid"]: prm["privs"].split(",") for m, p, prm in w if p == "/access/roles"}
-    assert roles["Hisho"] == ["VM.Audit", "VM.PowerMgmt", "Sys.Audit", "Sys.PowerMgmt"]
-    assert "Sys.Modify" in roles["HishoCreate"] and "SDN.Use" not in roles["HishoCreate"]   # not on this Proxmox
+    assert roles["Hisho-test-box"] == ["VM.Audit", "VM.PowerMgmt", "Sys.Audit", "Sys.PowerMgmt"]
+    assert "Sys.Modify" in roles["HishoCreate-test-box"] and "SDN.Use" not in roles["HishoCreate-test-box"]
     assert not any("Permissions" in x or "User" in x or "Sys.Console" == x for r in roles.values() for x in r)
-    assert ("POST", "/access/users", {"userid": "hisho@pve", "comment": w[2][2]["comment"]}) in w
-    assert ("PUT", "/access/acl", {"path": "/", "users": "hisho@pve", "roles": "Hisho,HishoCreate", "propagate": 1}) in w
-    assert w[-1][1] == "/access/users/hisho%40pve/token/hisho" and w[-1][2]["privsep"] == 0
-    assert "right-pass" not in json.dumps(out) and "user hisho@pve" in out["message"]
+    assert ("POST", "/access/users", {"userid": "hisho-test-box@pve", "comment": w[2][2]["comment"]}) in w
+    assert ("PUT", "/access/acl", {"path": "/", "users": "hisho-test-box@pve",
+                                   "roles": "Hisho-test-box,HishoCreate-test-box", "propagate": 1}) in w
+    assert w[-1][1] == "/access/users/hisho-test-box%40pve/token/hisho" and w[-1][2]["privsep"] == 0
+    assert not any(m == "PUT" and p.startswith("/access/roles") for m, p, _ in w)   # no role is ever rewritten
+    assert "right-pass" not in json.dumps(out) and "user hisho-test-box@pve" in out["message"]
 
 
-def test_sign_in_once_reuses_hishos_user_and_makes_a_new_token_name(pve):
+def test_next_to_a_live_hisho_nothing_of_its_is_changed_and_taken_names_get_a_suffix(pve):
     mod, fake = pve
-    fake.users, fake.tokens, fake.roles = ["hisho@pve"], ["hisho"], ["Administrator", "Hisho", "HishoCreate"]
+    fake.users += [*LIVE["users"], "hisho-test-box@pve"]          # another Hisho on a machine named test-box, too
+    fake.roles += [*LIVE["roles"], "HishoCreate-test-box"]
+    fake.tokens = {u: list(t) for u, t in LIVE["tokens"].items()} | {"hisho-test-box@pve": ["hisho"]}
+    fake.acl = [dict(a) for a in LIVE["acl"]]
+    before = (list(fake.users), list(fake.roles), json.dumps(fake.tokens), json.dumps(fake.acl))
     out = mod.connect({"url": "192.0.2.10", "user": "root@pam", "password": "right-pass"}, None)
-    import time
-    day = time.strftime("%Y%m%d")
-    assert out["entry"]["token_id"] == f"hisho@pve!hisho-{day}"
-    paths = [(m, p) for m, p, _ in fake.writes()]
-    assert ("POST", "/access/users") not in paths and ("POST", "/access/roles") not in paths
-    assert ("PUT", "/access/roles/Hisho") in paths and ("PUT", "/access/roles/HishoCreate") in paths   # kept current
-    assert mod._token_name({"hisho", f"hisho-{day}"}) == f"hisho-{day}-2"
+    assert out["entry"]["token_id"] == "hisho-test-box-2@pve!hisho"
+    assert out["entry"]["made"] == {"user": "hisho-test-box-2@pve", "roles": ["Hisho-test-box-2", "HishoCreate-test-box-2"],
+                                    "tokens": ["hisho"], "acl": ["/"]}
+    existing = {"/access/roles/Hisho", "/access/roles/HishoCreate", "/access/roles/HishoCreate-test-box",
+                "/access/users/hisho%40pve", "/access/users/hisho-test-box%40pve"}
+    for m, p, prm in fake.writes():
+        assert not any(p == e or p.startswith(e + "/") for e in existing), (m, p)
+        assert m != "PUT" or p == "/access/acl" and prm["users"] == "hisho-test-box-2@pve" and not prm.get("delete")
+        assert m != "DELETE"
+        assert prm.get("roleid") not in before[1] and prm.get("userid") not in before[0]
+    # everything the live Hisho had is still there, as it was
+    assert set(before[0]) <= set(fake.users) and set(before[1]) <= set(fake.roles)
+    assert all(a in fake.acl for a in json.loads(before[3]))
+    assert fake.tokens["hisho@pve"] == ["hisho"] and fake.tokens["hisho-test-box@pve"] == ["hisho"]
+    assert mod.names_for("souko", 3) == {"user": "hisho-souko-3@pve",
+                                         "roles": {"Hisho-souko-3": "Hisho", "HishoCreate-souko-3": "HishoCreate"}}
+
+
+def test_a_sign_in_that_fails_halfway_deletes_only_what_it_just_made(pve):
+    mod, fake = pve
+    fake.users, fake.roles = [*fake.users, *LIVE["users"]], [*fake.roles, *LIVE["roles"]]
+    fake.acl = [dict(a) for a in LIVE["acl"]]
+    fake.fail = ("POST", "/access/users/hisho-test-box%40pve/token/hisho")
+    with pytest.raises(mod.ConnectError, match="undid what it had made"):
+        mod.connect({"url": "192.0.2.10", "user": "root@pam", "password": "right-pass"}, None)
+    assert fake.users == ["root@pam", "hisho@pve"] and fake.roles == ["Administrator", "PVEAuditor", "Hisho", "HishoCreate"]
+    assert fake.acl == LIVE["acl"]
+
+
+def test_remove_from_proxmox_deletes_exactly_what_was_made_and_nothing_else(pve):
+    mod, fake = pve
+    fake.users += LIVE["users"]
+    fake.roles += LIVE["roles"]
+    fake.tokens = {u: list(t) for u, t in LIVE["tokens"].items()}
+    fake.acl = [dict(a) for a in LIVE["acl"]]
+    entry = mod.connect({"url": "192.0.2.10", "user": "root@pam", "password": "right-pass"}, None)["entry"]
+    fake.users.append("someone@pve")
+    fake.tokens["someone@pve"] = ["hisho"]                               # a token named hisho of another user
+    fake.calls.clear()
+    out = mod.disconnect(entry, {"user": "root@pam", "password": "right-pass"}, None)
+    assert out["ok"] and "right-pass" not in out["message"]
+    deletes = [(m, p, prm) for m, p, prm in fake.writes()]
+    assert [(m, p) for m, p, _ in deletes] == [
+        ("DELETE", "/access/users/hisho-test-box%40pve/token/hisho"),
+        ("PUT", "/access/acl"), ("PUT", "/access/acl"),
+        ("DELETE", "/access/users/hisho-test-box%40pve"),
+        ("DELETE", "/access/roles/Hisho-test-box"), ("DELETE", "/access/roles/HishoCreate-test-box")]
+    assert all(prm["delete"] == 1 and prm["users"] == "hisho-test-box@pve" for m, p, prm in deletes if m == "PUT")
+    assert fake.users == ["root@pam", "hisho@pve", "someone@pve"]
+    assert fake.roles == ["Administrator", "PVEAuditor", "Hisho", "HishoCreate"]
+    assert fake.tokens == {"hisho@pve": ["hisho"], "someone@pve": ["hisho"]} and fake.acl == LIVE["acl"]
+    assert "deleted token hisho" in out["message"] and "user hisho-test-box@pve" in out["message"]
+
+
+def test_remove_says_what_was_already_gone_and_keeps_a_role_someone_else_is_given(pve):
+    mod, fake = pve
+    entry = mod.connect({"url": "192.0.2.10", "user": "root@pam", "password": "right-pass"}, None)["entry"]
+    fake.tokens["hisho-test-box@pve"].remove("hisho")                     # the owner removed the token by hand
+    fake.acl.append({"path": "/vms", "type": "user", "ugid": "root@pam", "roleid": "Hisho-test-box", "propagate": 1})
+    out = mod.disconnect(entry, {"user": "root@pam", "password": "right-pass"}, None)
+    assert out["ok"]
+    assert "already gone: token hisho" in out["message"] and "kept role Hisho-test-box" in out["message"]
+    assert "Hisho-test-box" in fake.roles and "HishoCreate-test-box" not in fake.roles
+    assert fake.users == ["root@pam"]
+    fake.calls.clear()
+    again = mod.disconnect(entry, {"user": "root@pam", "password": "right-pass"}, None)   # all gone now: fine
+    assert again["ok"] and "already gone: user hisho-test-box@pve" in again["message"]
+    assert [(m, p) for m, p, _ in fake.writes()] == []
+
+
+def test_remove_refuses_a_changed_certificate_and_names_hisho_never_made(pve, monkeypatch):
+    mod, fake = pve
+    entry = {"url": "192.0.2.10", "fingerprint": "CC:DD", "made": MADE}
+    with pytest.raises(mod.ConnectError, match="not the one Hisho remembers"):
+        mod.disconnect(entry, {"user": "root@pam", "password": "right-pass"}, None)
+    assert fake.calls == []                                               # the login was never sent
+    with pytest.raises(mod.ConnectError, match="not a user Hisho makes"):
+        mod.disconnect({"url": "192.0.2.10", "made": {"user": "root@pam"}},
+                       {"user": "root@pam", "password": "right-pass"}, None)
+    with pytest.raises(mod.ConnectError, match="not one Hisho makes"):
+        mod.disconnect({"url": "192.0.2.10", "made": {"user": "hisho-x@pve", "roles": ["Administrator"]}},
+                       {"user": "root@pam", "password": "right-pass"}, None)
+    assert fake.writes() == []
+    assert not mod.disconnect({"url": "192.0.2.10", "token_id": "me@pam!t"}, {}, None)["ok"]   # made by hand
 
 
 def test_a_wrong_password_says_so_without_the_password(pve):
@@ -352,6 +494,13 @@ def test_a_wrong_password_says_so_without_the_password(pve):
         mod.connect({"url": "192.0.2.10", "user": "root@pam", "password": "wrong-pass"}, None)
     assert "refused the sign-in for root@pam" in str(e.value) and "wrong-pass" not in str(e.value)
     assert fake.writes() == []                               # nothing made
+
+
+def test_the_machine_name_falls_back_to_the_hostname(addon, monkeypatch):
+    mod = addons.provider(addon)
+    monkeypatch.setattr("hisho.fleet_config.local_name", lambda: (_ for _ in ()).throw(RuntimeError()))
+    monkeypatch.setattr("socket.gethostname", lambda: "My_Box.example.lan")
+    assert mod._machine() == "my-box"
 
 
 def test_two_factor_and_an_unreachable_server_are_said_plainly(monkeypatch, addon):
@@ -365,7 +514,7 @@ def test_two_factor_and_an_unreachable_server_are_said_plainly(monkeypatch, addo
         mod.connect({"url": "192.0.2.10", "user": "root@pam", "password": "x"}, None)
 
 
-def test_sign_in_once_through_core_tests_and_saves_the_token(fleet, pve, monkeypatch, tmp_path):
+def test_sign_in_once_and_remove_through_core(fleet, pve, monkeypatch, tmp_path):
     from hisho import connect as hconnect
     monkeypatch.setattr(addons, "LOCAL_SECRETS", str(tmp_path / "secrets.env"))
     mod, fake = pve
@@ -380,7 +529,12 @@ def test_sign_in_once_through_core_tests_and_saves_the_token(fleet, pve, monkeyp
     px = addons.get("proxmox")
     out = hconnect.connect(px, "pve1", {"url": "192.0.2.10", "user": "root@pam", "password": "right-pass"})
     assert out["ok"], out
-    assert seen[-1] == ("https://192.0.2.10:8006", "hisho@pve!hisho=1111-2222-secret", "AA:BB")
+    assert seen[-1] == ("https://192.0.2.10:8006", "hisho-test-box@pve!hisho=1111-2222-secret", "AA:BB")
     e = addons.read_config("proxmox")["entries"]["pve1"]
-    assert e["token_id"] == "hisho@pve!hisho" and e["fingerprint"] == "AA:BB" and "password" not in e
+    assert e["token_id"] == "hisho-test-box@pve!hisho" and e["fingerprint"] == "AA:BB" and "password" not in e
+    assert e["made"] == MADE
     assert "1111-2222-secret" not in Path(addons.config_path("proxmox")).read_text()
+    gone = hconnect.disconnect(px, "pve1", {"user": "root@pam", "password": "right-pass"})
+    assert gone["ok"], gone
+    assert "pve1" not in (addons.read_config("proxmox").get("entries") or {})
+    assert fake.users == ["root@pam"] and fake.roles == ["Administrator", "PVEAuditor"]

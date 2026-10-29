@@ -18,7 +18,7 @@ sleeping server keeps its row and is woken by the update.
 
 - You need:
   - A Proxmox VE server you can reach from the Core machine
-  - Its admin login (e.g. root@pam) once, so Hisho can make its own limited user and token; or a Proxmox API token made by hand
+  - Its admin login (e.g. root@pam) once, so Hisho can make its own limited user and token (and once more if you remove it); or a Proxmox API token made by hand
 - Runs on: the Core machine, inside Hisho Core
 - One entry per Proxmox server, each with:
   - `url` (str, required)
@@ -29,6 +29,7 @@ sleeping server keeps its row and is woken by the update.
   - `note` (str, optional)
   - `thermal_ssh` (str, optional)
   - `thermal_key` (str, optional)
+  - `made` (map, optional)
 
 ## How to install
 
@@ -52,14 +53,20 @@ Hisho sees (their sign-in page on port 8006); press **Use this** (or type the ad
 name, type an admin login such as `root@pam` and its password, and press **Sign in once**. Hisho signs in
 once and makes its own access, then tests it and saves it:
 
-- user `hisho@pve` (no password, token only),
-- role `Hisho` on `/`: `VM.Audit VM.PowerMgmt Sys.Audit Sys.PowerMgmt` (see the servers, VMs and containers,
-  start and shut them down, shut a server down cleanly),
-- role `HishoCreate` on `/`: what Core's "add a machine" needs (create a VM, its disks and cloud-init, put
+- user `hisho-<machine>@pve` (no password, token only), where `<machine>` is the name of the machine Hisho runs
+  on (e.g. `hisho-kihon@pve`),
+- role `Hisho-<machine>` on `/`: `VM.Audit VM.PowerMgmt Sys.Audit Sys.PowerMgmt` (see the servers, VMs and
+  containers, start and shut them down, shut a server down cleanly),
+- role `HishoCreate-<machine>` on `/`: what Core's "add a machine" needs (create a VM, its disks and cloud-init, put
   Ubuntu's image on a storage; `Sys.Modify` is what Proxmox asks for to download it),
-- an API token `hisho` for that user (`hisho-<date>` if one by that name exists) with the user's rights.
+- an API token `hisho` for that user with the user's rights.
 
-Neither role can change users or permissions or open a shell on the server. Remove the `HishoCreate`
+Hisho only makes new things: it never changes or reuses a user, role, token or permission that is already there
+(another Hisho's, or yours). If a name is taken it uses the next free one with the same suffix on all three
+(`hisho-kihon-2@pve`, `Hisho-kihon-2`, `HishoCreate-kihon-2`). The entry remembers what it made (`made`: names
+only); if something fails halfway, Hisho deletes what it had just made.
+
+Neither role can change users or permissions or open a shell on the server. Remove the `HishoCreate-<machine>`
 permission (Datacenter > Permissions) if you never make machines from Hisho. The admin password is used
 once and not kept; the token's secret is kept only on the Core machine (`~/.hisho-secrets.env`).
 
@@ -68,15 +75,22 @@ Or open **+ add by filling in every field yourself** and paste a token you made 
 remembers the server's certificate fingerprint. You can give a secret's name from Infisical or Bitwarden
 instead of the secret. Entries are kept in `~/Hisho/System/Config/Addons/proxmox.yaml`.
 
-To rotate a token: Proxmox > Datacenter > Permissions > API Tokens, remove it, then Sign in once again
-(or add one by hand and paste it on the server's entry).
+To rotate a token: press **Remove from Proxmox** on the server's entry, then Sign in once again (or add one by
+hand and paste it on the server's entry).
+
+**Remove from Proxmox** (on an entry made with Sign in once) asks for the admin login once more and deletes
+exactly what that entry's `made` lists: its token, the permissions of its user, the user, then its roles (a role
+that someone else is still given stays, and the message says so). Anything already gone is said, not an error.
+It checks the server's certificate is the one Hisho remembers before sending the login. Then Hisho forgets the
+entry.
 
 ## How to remove
 
 **Add-ons > Store > Proxmox > Remove**, or `hisho addon remove proxmox`. Its card and page go away;
 your servers stay listed in `~/Hisho/System/Config/Addons/proxmox.yaml`, so installing it again
-picks up where you left off. Nothing on the Proxmox servers is changed: the `hisho@pve` user, its roles and
-token stay until you remove them there (Datacenter > Permissions).
+picks up where you left off. Nothing on the Proxmox servers is changed: Hisho's `hisho-<machine>@pve` user, its
+roles and token stay. To delete those too, press **Remove from Proxmox** on each server's entry first (or remove
+them in Proxmox, Datacenter > Permissions).
 
 ## License
 
